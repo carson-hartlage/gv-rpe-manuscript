@@ -1,0 +1,906 @@
+---
+title: "Main analysis"
+author: "Carson Hartlage"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+        toc: true
+        toc_float: 
+            collapsed: false
+            smooth_scroll: true
+        code_download: true
+        code_folding: hide
+        highlight: pygments
+        df_print: kable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(PEASDataCommons)
+library(IRanges)
+library(dplyr)
+library(addr)
+library(sf)
+library(units)
+library(tidyr)
+library(purrr)
+library(readr)
+library(lubridate)
+library(survival)
+library(broom)
+library(survminer)
+library(parallel)
+library(ggsurvfit)
+library(cowplot)
+```
+
+### Load patient data
+```{r}
+d <- readRDS("~/PEAS_pe_encounters_v0.3.rds") |>
+  dplyr::select(c(MRN, PAT_ENC_CSN_ID, VISIT_DATE, DOB, lat, lon)) 
+
+a <- readRDS("~/address_history_2.23.25.rds") |>
+  dplyr::select(c(MRN, imputed_start_date, imputed_end_date, address, addr, lat, lon)) |>
+  filter(MRN %in% d$MRN,
+         imputed_end_date >= "2016-01-01",
+         imputed_start_date <= "2024-12-31",
+         !is.na(lat), !is.na(lon),
+         imputed_end_date > imputed_start_date) |>
+  st_as_sf(coords = c("lon", "lat"), crs = 4326)
+
+tracts <- cincy::tract_tigris_2020
+city <- cincy::neigh_sna |>
+  st_union() |>
+  st_transform(st_crs(a))
+
+a <- a |>
+  filter(st_within(geometry, city, sparse = FALSE)[, 1]) |>
+  st_transform(st_crs(tracts)) |>
+  st_join(tracts, join = st_within) |>
+  filter(!is.na(census_tract_id_2020))
+```
+
+### Load and join covariate data
+```{r, echo=FALSE}
+dep_index <- 'https://github.com/geomarker-io/dep_index/raw/master/2023/data/ACS_deprivation_index_by_census_tracts.rds' %>% 
+  url() %>% 
+  gzcon() %>% 
+  readRDS() %>% 
+  as_tibble() |>
+  dplyr::select(census_tract_id_2020, dep_index) |>
+  filter(census_tract_id_2020 %in% tracts$census_tract_id_2020) |>
+  st_drop_geometry()
+
+ltc <- st_read("~/crime_incidents_with_street_range_2026_02_16.gpkg") |>
+  mutate(DATE_FROM = as.Date(DATE_FROM)) |>
+  filter(DATE_FROM >= "2019-01-01" & DATE_FROM <= "2023-12-31") |>
+  dplyr::select(c(DATE_FROM, geom)) |>
+  st_transform(crs = st_crs(tracts))
+ltc <- ltc |>
+  st_join(tracts, join = st_intersects) |>
+  st_drop_geometry() |> 
+  group_by(census_tract_id_2020) |>
+  summarize(incidents = n())
+ltc <- left_join(tracts, ltc, by = "census_tract_id_2020") |>
+  mutate(incidents = if_else(is.na(incidents), 0, incidents)) |>
+  st_drop_geometry()
+
+aa <- a |>
+  left_join(racial_comp_data, join_by(census_tract_id_2020 == GEOID)) |>
+  left_join(dep_index, by = "census_tract_id_2020") |>
+  left_join(ltc, by = "census_tract_id_2020") |>
+  filter(!is.na(prop_white_tract),
+         !is.na(incidents),
+         !is.na(dep_index))
+```
+
+### Process address histories
+```{r}
+addresses <- aa |>
+  #st_drop_geometry() |>
+  arrange(MRN, addr, imputed_start_date) |>
+  group_by(MRN, addr) |>
+  mutate(
+    new_window = imputed_start_date >
+      lag(imputed_end_date, default = imputed_start_date[1]),
+    window_id = cumsum(new_window)
+  ) |>
+  group_by(MRN, addr, window_id) |>
+  mutate(
+    imputed_start_date = min(imputed_start_date),
+    imputed_end_date   = max(imputed_end_date)
+  ) |>
+  distinct(MRN, addr, window_id, .keep_all = TRUE) |>
+  ungroup() |>
+  select(-window_id, -new_window)
+
+visit_address <- d |>
+  left_join(addresses, join_by(MRN == MRN, 
+                               VISIT_DATE >= imputed_start_date,
+                               VISIT_DATE <= imputed_end_date),
+            relationship = "many-to-many"
+  ) |>
+  slice_max(order_by = imputed_start_date, n = 1, by = c(MRN, PAT_ENC_CSN_ID), with_ties = FALSE) |>
+  filter(!is.na(census_tract_id_2020))
+
+## for each MRN, define inclusion date as first exacerbation
+inclusion <- visit_address |>
+  group_by(MRN) |>
+  summarise(inclusion_date = min(VISIT_DATE), .groups = "drop")
+
+addresses <- addresses |>
+  left_join(inclusion, by = "MRN") |>
+  filter(imputed_end_date >= inclusion_date)
+
+# identify last known continuous Cincinnati address
+last_continuous <- addresses |>
+  arrange(MRN, imputed_start_date) |>
+  group_by(MRN) |>
+  mutate(segment = cumsum(
+    coalesce(as.integer(imputed_start_date - lag(imputed_end_date)) > 1, FALSE)
+  )) |>
+  filter(segment == 0) |>
+  summarise(last_address_end = max(imputed_end_date), .groups = "drop") |>
+  st_drop_geometry()
+
+### exclusion: date of second exacerbation, if they have one, end date of last matched address
+second_exac <- visit_address |>
+  arrange(MRN, VISIT_DATE) |>
+  group_by(MRN) |>
+  summarise(date_second_exac = if (n() >= 2) VISIT_DATE[2] else NA,
+            .groups = "drop")
+
+## SENSITIVITY ANALYSIS
+# second_exac <- visit_address |>
+#   left_join(inclusion, by = "MRN") |>
+#   arrange(MRN, VISIT_DATE) |>
+#   group_by(MRN) |>
+#   summarise(
+#     date_second_exac = if (
+#       n() >= 2 && VISIT_DATE[2] > dplyr::first(inclusion_date) + 7
+#     ) VISIT_DATE[2] else NA,
+#     .groups = "drop"
+#   )
+
+exclusion <- left_join(last_continuous, second_exac, by = "MRN") |>
+  left_join(dplyr::select(d, c(MRN, DOB)), by = "MRN") |>
+  mutate(age_out = DOB + years(18)) |>
+  distinct()
+
+exclusion <- exclusion |>
+  rowwise() |>
+  mutate(
+    exclusion_date = min(
+      c(date_second_exac, last_address_end, age_out)[
+        !is.na(c(date_second_exac, last_address_end, age_out))])) |>
+  ungroup()
+
+addresses <- addresses |>
+  left_join(exclusion, by = "MRN") |>
+  filter(imputed_start_date <= exclusion_date) |>
+  distinct()
+
+pts <- addresses |>
+  st_drop_geometry() |>
+  group_by(MRN) |>
+  summarise(futime = as.numeric(dplyr::first(exclusion_date - inclusion_date)), 
+            age_at_inclusion = as.numeric(min(inclusion_date - DOB)/365.25),
+            .groups = "drop") |>
+  filter(futime > 0)
+
+addresses <- addresses %>%
+  filter(MRN %in% pts$MRN) %>%
+  group_by(MRN) %>%
+  mutate(
+    imputed_start_date = if_else(
+      imputed_start_date == min(imputed_start_date) &
+      min(imputed_start_date) < dplyr::first(inclusion_date),
+      dplyr::first(inclusion_date),
+      imputed_start_date
+    ),
+    imputed_end_date = pmin(imputed_end_date, dplyr::first(exclusion_date), na.rm = TRUE)
+  ) %>%
+  ungroup() |>
+  mutate(days_at_address = as.numeric(imputed_end_date - imputed_start_date)) |>
+  filter(days_at_address > 0)
+```
+
+### Load exposure date (gun violence incidents from GVA)
+```{r}
+g <- read.csv("~/gun-violence-incidents-hamilton.csv") |>
+  mutate(incident_date = as.Date(date)) |>
+  filter(date >= "2016-01-01" & date <= "2024-12-31") |>
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326) |> 
+  st_transform(crs = st_crs(aa))
+```
+
+### Main exposure definition
+```{r, eval=FALSE}
+time = 14
+distance = 400
+
+  gun <- g |>
+    mutate(days_after = incident_date + days(time))
+
+  addresses_buffer <- st_buffer(addresses, dist = units::set_units(distance, "m"))
+  x <- st_join(addresses_buffer, gun, join = st_intersects) 
+  
+  x <- x |>
+    filter(incident_date >= imputed_start_date & incident_date < imputed_end_date)
+
+  xx <- x |>
+    st_drop_geometry() |>
+    arrange(MRN, addr, incident_date) |>
+    group_by(MRN, addr, imputed_start_date) |>
+    mutate(
+      new_window = incident_date > lag(days_after, default = min(incident_date)),
+      window_id = cumsum(new_window)
+    ) |>
+    group_by(MRN, addr, imputed_start_date, window_id) |>
+    summarise(
+      crime_exp_start = min(incident_date),
+      crime_exp_end   = max(days_after),
+      .groups = "drop"
+    ) |>
+    mutate(exposure_days = crime_exp_end - crime_exp_start)
+
+  aaa <- addresses |>
+    left_join(xx, by = c("MRN", "addr", "imputed_start_date"))
+
+  result <- aaa %>%
+    mutate(.row_id = row_number()) %>%
+    group_by(.row_id) %>%
+    group_modify(~ {
+      row_df <- .x
+      rows_out <- list()
+
+      if (is.na(row_df$crime_exp_start)) {
+        temp <- row_df
+        temp$start <- temp$imputed_start_date
+        temp$end <- temp$imputed_end_date
+        temp$crime_exposure <- FALSE
+        rows_out <- list(temp)
+      } else {
+        overlap_start <- max(row_df$imputed_start_date, row_df$crime_exp_start)
+        overlap_end   <- min(row_df$imputed_end_date, row_df$crime_exp_end)
+        is_overlap <- overlap_start < overlap_end
+
+        if (row_df$crime_exp_start > row_df$imputed_start_date) {
+          temp <- row_df
+          temp$start <- row_df$imputed_start_date
+          temp$end <- row_df$crime_exp_start
+          temp$crime_exposure <- FALSE
+          rows_out <- append(rows_out, list(temp))
+        }
+        if (row_df$crime_exp_end < row_df$imputed_end_date) {
+          temp <- row_df
+          temp$start <- row_df$crime_exp_end
+          temp$end <- row_df$imputed_end_date
+          temp$crime_exposure <- FALSE
+          rows_out <- append(rows_out, list(temp))
+        }
+        if (is_overlap) {
+          temp <- row_df
+          temp$start <- overlap_start
+          temp$end <- overlap_end
+          temp$crime_exposure <- TRUE
+          rows_out <- append(rows_out, list(temp))
+        }
+        if (length(rows_out) == 0) {
+          temp <- row_df
+          temp$start <- row_df$imputed_start_date
+          temp$end <- row_df$imputed_end_date
+          temp$crime_exposure <- FALSE
+          rows_out <- list(temp)
+        }
+      }
+      bind_rows(rows_out)
+    }) %>%
+    ungroup() %>%
+    dplyr::select(-.row_id)
+
+  result <- result %>%
+    group_by(MRN) %>%
+    arrange(start, .by_group = TRUE) %>%
+    mutate(
+      reexac = row_number() == n() &
+        !is.na(date_second_exac) &
+        exclusion_date == date_second_exac
+    ) %>%
+    ungroup()
+
+  data <- result |>
+    dplyr::select(c(MRN, addr, dep_index, prop_white_tract, incidents, start, end, crime_exposure, reexac)) |>
+    group_by(MRN) |>
+    mutate(
+      origin_date = min(start),
+      end_date = max(end),
+      tstart = as.numeric(start - origin_date),
+      tstop  = as.numeric(end - origin_date)
+    ) |>
+    ungroup() |>
+    filter(tstop > tstart) |>
+    mutate(
+      date_time = as.numeric(end_date - origin_date),
+    ) |>
+    group_by(MRN) |>
+    mutate(t_time = max(tstop) - min(tstart)) |>
+    ungroup()
+
+  data2 <- data %>%
+    group_by(MRN) %>%
+    group_modify(~{
+      df <- .x
+      origin <- unique(df$origin_date)
+      min_date <- min(df$start)
+      max_date <- max(df$end)
+      season_cuts <- seq(floor_date(min_date, "year") - years(1),
+                         ceiling_date(max_date, "year") + years(1),
+                         by = "3 months")
+      season_cuts <- season_cuts[month(season_cuts) %in% c(12,3,6,9)]
+      season_cuts <- as.numeric(season_cuts - origin)
+      season_cuts <- season_cuts[season_cuts > 0 & season_cuts < max(df$tstop)]
+      if(length(season_cuts) == 0) return(df)
+      survSplit(Surv(tstart, tstop, reexac) ~ ., data = df, cut = season_cuts, episode = "season_episode")
+    }) %>%
+    ungroup() %>%
+    mutate(
+      start_date = origin_date + tstart,
+      season = case_when(
+        month(start_date) %in% c(12,1,2)  ~ "Winter",
+        month(start_date) %in% c(3,4,5)   ~ "Spring",
+        month(start_date) %in% c(6,7,8)   ~ "Summer",
+        month(start_date) %in% c(9,10,11) ~ "Fall"
+      )
+    )
+  data2$dep_cat <- cut(
+    data2$dep_index,
+    breaks = quantile(data2$dep_index, probs = seq(0,1,0.25), na.rm = TRUE),
+    include.lowest = TRUE)
+
+  data2$inc_cat <- cut(
+    data2$incidents,
+    breaks = quantile(data2$incidents, probs = seq(0,1,0.25), na.rm = TRUE),
+    include.lowest = TRUE
+    )
+
+  model2 <- coxph(
+    Surv(tstart, tstop, reexac) ~
+      crime_exposure +
+      cluster(MRN),
+    data = data2
+  )
+  cat("\n--- Unadjusted model ---\n")
+  cat("HR (crime_exposure):", round(exp(coef(model2)["crime_exposureTRUE"]), 3), "\n")
+  cat("95% CI:", round(exp(confint(model2)["crime_exposureTRUE", 1]), 3), "-",
+      round(exp(confint(model2)["crime_exposureTRUE", 2]), 3), "\n")
+  
+  model <- coxph(
+  Surv(tstart, tstop, reexac) ~
+    crime_exposure +
+    strata(dep_cat, inc_cat) +
+    season +
+    cluster(MRN),
+  data = data2
+)
+#ph_test <- cox.zph(model)
+
+  cat("\n--- Model with covariates ---\n")
+  cat("HR (crime_exposure):", round(exp(coef(model)["crime_exposureTRUE"]), 3), "\n")
+  cat("95% CI:", round(exp(confint(model)["crime_exposureTRUE", 1]), 3), "-",
+      round(exp(confint(model)["crime_exposureTRUE", 2]), 3), "\n")
+  print(summary(model))
+```
+
+```{r}
+calc_paf <- function(dat) {
+  fit <- coxph(
+    Surv(tstart, tstop, reexac) ~
+      crime_exposure +
+      strata(dep_cat, inc_cat) +
+      prop_white_tract +
+      season +
+      cluster(MRN),
+    data = dat
+  )
+  basehaz_df <- basehaz(
+    fit,
+    centered = FALSE
+  )
+  get_H0 <- function(times, basehaz_df) {
+    sapply(times, function(t) {
+      max(
+        basehaz_df$hazard[
+          basehaz_df$time <= t
+        ]
+      )
+    })
+  }
+  dat$lp_obs <- predict(
+    fit,
+    newdata = dat,
+    type = "lp"
+  )
+
+  dat_cf <- dat
+  dat_cf$crime_exposure <- FALSE
+
+  dat_cf$lp_cf <- predict(
+    fit,
+    newdata = dat_cf,
+    type = "lp"
+  )
+  dat$H0 <- get_H0(
+    dat$tstop,
+    basehaz_df
+  )
+  dat_cf$H0 <- get_H0(
+    dat_cf$tstop,
+    basehaz_df
+  )
+  dat$row_surv <- exp(
+    -dat$H0 * exp(dat$lp_obs)
+  )
+  dat_cf$row_surv <- exp(
+    -dat_cf$H0 * exp(dat_cf$lp_cf)
+  )
+  obs_risk <- dat %>%
+    group_by(MRN) %>%
+    summarise(
+      risk = 1 - prod(row_surv),
+      .groups = "drop"
+    )
+  cf_risk <- dat_cf %>%
+    group_by(MRN) %>%
+    summarise(
+      risk = 1 - prod(row_surv),
+      .groups = "drop"
+    )
+  (
+    mean(obs_risk$risk) -
+      mean(cf_risk$risk)
+  ) / mean(obs_risk$risk)
+}
+
+set.seed(12345)
+B <- 1000
+mrns <- unique(data2$MRN)
+
+rows_by_mrn <- split(
+  seq_len(nrow(data2)),
+  data2$MRN
+)
+
+ncores <- max(
+  1,
+  detectCores() - 1
+)
+
+cl <- makeCluster(ncores)
+clusterExport(
+  cl,
+  c(
+    "data2",
+    "mrns",
+    "rows_by_mrn",
+    "calc_paf"
+  ),
+  envir = environment()
+)
+
+boot_paf <- parSapply(
+  cl,
+  1:B,
+  function(i) {
+
+    sampled_mrns <- sample(
+      mrns,
+      size = length(mrns),
+      replace = TRUE
+    )
+
+    sampled_rows <- lapply(
+      sampled_mrns,
+      function(x) {
+        rows_by_mrn[[as.character(x)]]
+      }
+    )
+
+    boot_rows <- unlist(
+      sampled_rows,
+      use.names = FALSE
+    )
+
+    boot_dat <- data2[
+      boot_rows,
+      ,
+      drop = FALSE
+    ]
+
+    boot_id <- rep(
+      seq_along(sampled_mrns),
+      lengths(sampled_rows)
+    )
+
+    boot_dat$MRN <- paste0(
+      "boot_",
+      boot_id
+    )
+
+    calc_paf(boot_dat)
+  }
+)
+
+stopCluster(cl)
+
+PAF <- calc_paf(data2)
+CI <- quantile(
+  boot_paf,
+  probs = c(0.025, 0.975),
+  na.rm = TRUE
+)
+
+######
+sf <- survfit(
+  Surv(tstart, tstop, reexac) ~ crime_exposure,
+  data = data2
+)
+
+max_time <- 1110
+
+landmarks <- seq(30, max_time, by = 90)
+landmarks <- sort(unique(c(landmarks, max_time)))
+
+p_curve <- sf %>%
+    ggsurvfit(type = "risk", linewidth = 0.8) +
+    add_confidence_interval() +
+    scale_color_manual(
+        values = c("steelblue", "firebrick"),
+        labels = c("Not exposed", "Exposed")
+    ) +
+    scale_fill_manual(
+        values = c("steelblue", "firebrick"),
+        labels = c("Not exposed", "Exposed")
+    ) +
+    scale_x_continuous(
+        breaks = landmarks,
+        limits = c(0, max_time),
+        expand = c(0, 0)
+    ) +
+    scale_y_continuous(
+        expand = c(0, 0)
+    ) +
+    coord_cartesian(
+        ylim = c(0, 1)
+    ) +
+    labs(
+        x = "Days since inclusion",
+        y = "Cumulative rate of recurrent exacerbation",
+        color = NULL,
+        fill = NULL
+    ) +
+    theme(
+        legend.position = "top",
+        plot.margin = margin(
+            t = 0,
+            r = 15,
+            b = 0,
+            l = 35
+        )
+    )
+
+# risk_at <- function(t, data) { 
+#   data |> filter(tstart <= t, tstop > t) |> 
+#     group_by(MRN) |> 
+#     summarise(crime_exposure = any(crime_exposure), .groups = "drop") |> count(crime_exposure, name = "n_at_risk") 
+#   }
+risk_table <- purrr::map_dfr(
+    landmarks,
+    ~ risk_at(.x, data2) |> mutate(time = .x)
+) |>
+    mutate(
+        group = factor(
+            crime_exposure,
+            levels = c(FALSE, TRUE),
+            labels = c("Not exposed", "Exposed")
+        ),
+        n_at_risk = tidyr::replace_na(n_at_risk, 0)
+    )
+
+p_table <- risk_table %>%
+    ggplot(
+        aes(
+            x = time,
+            y = group,
+            label = n_at_risk
+        )
+    ) +
+    geom_text(
+        size = 3.2,
+        hjust = 0.5
+    ) +
+    scale_x_continuous(
+        breaks = landmarks,
+        limits = c(0, max_time),
+        expand = c(0, 0)
+    ) +
+    scale_y_discrete(
+        expand = expansion(add = 0.5)
+    ) +
+    labs(
+        x = NULL,
+        y = NULL
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+        panel.grid = element_blank(),
+        axis.text.y = element_text(size = 12, hjust=0.8),
+        axis.ticks.y = element_blank(),
+        axis.text.x = element_blank(),
+        axis.ticks.x = element_blank(),
+        plot.margin = margin(
+            t = 0,
+            r = 15,
+            b = 5.5,
+            l = 35
+        )
+    ) +
+    coord_cartesian(
+        clip = "off"
+    )
+
+p <- plot_grid(
+    p_curve,
+    p_table,
+    ncol = 1,
+    align = "v",
+    axis = "lr",
+    rel_heights = c(4, 1.2)
+)
+# ggsave( "plot_grid.pdf", plot = p, width = 800 / 96, height = 550 / 96, units = "in", device = "pdf" )
+```
+
+
+```{r}
+run_models <- function(time = 14, distance = 400) {
+  gun <- g |>
+    mutate(days_after = incident_date + days(time))
+
+  addresses_buffer <- st_buffer(addresses, dist = units::set_units(distance, "m"))
+  x <- st_join(addresses_buffer, gun, join = st_intersects) 
+  
+  x <- x |>
+    filter(incident_date >= imputed_start_date & incident_date < imputed_end_date)
+
+  xx <- x |>
+    st_drop_geometry() |>
+    arrange(MRN, addr, incident_date) |>
+    group_by(MRN, addr, imputed_start_date) |>
+    mutate(
+      new_window = incident_date > lag(days_after, default = first(incident_date)),
+      window_id = cumsum(new_window)
+    ) |>
+    group_by(MRN, addr, imputed_start_date, window_id) |>
+    summarise(
+      crime_exp_start = min(incident_date),
+      crime_exp_end   = max(days_after),
+      .groups = "drop"
+    ) |>
+    mutate(exposure_days = crime_exp_end - crime_exp_start)
+
+  aaa <- addresses |>
+    left_join(xx, by = c("MRN", "addr", "imputed_start_date"))
+
+  result <- aaa %>%
+    mutate(.row_id = row_number()) %>%
+    group_by(.row_id) %>%
+    group_modify(~ {
+      row_df <- .x
+      rows_out <- list()
+
+      if (is.na(row_df$crime_exp_start)) {
+        temp <- row_df
+        temp$start <- temp$imputed_start_date
+        temp$end <- temp$imputed_end_date
+        temp$crime_exposure <- FALSE
+        rows_out <- list(temp)
+      } else {
+        overlap_start <- max(row_df$imputed_start_date, row_df$crime_exp_start)
+        overlap_end   <- min(row_df$imputed_end_date, row_df$crime_exp_end)
+        is_overlap <- overlap_start < overlap_end
+
+        if (row_df$crime_exp_start > row_df$imputed_start_date) {
+          temp <- row_df
+          temp$start <- row_df$imputed_start_date
+          temp$end <- row_df$crime_exp_start
+          temp$crime_exposure <- FALSE
+          rows_out <- append(rows_out, list(temp))
+        }
+        if (row_df$crime_exp_end < row_df$imputed_end_date) {
+          temp <- row_df
+          temp$start <- row_df$crime_exp_end
+          temp$end <- row_df$imputed_end_date
+          temp$crime_exposure <- FALSE
+          rows_out <- append(rows_out, list(temp))
+        }
+        if (is_overlap) {
+          temp <- row_df
+          temp$start <- overlap_start
+          temp$end <- overlap_end
+          temp$crime_exposure <- TRUE
+          rows_out <- append(rows_out, list(temp))
+        }
+        if (length(rows_out) == 0) {
+          temp <- row_df
+          temp$start <- row_df$imputed_start_date
+          temp$end <- row_df$imputed_end_date
+          temp$crime_exposure <- FALSE
+          rows_out <- list(temp)
+        }
+      }
+      bind_rows(rows_out)
+    }) %>%
+    ungroup() %>%
+    dplyr::select(-.row_id)
+
+  result <- result %>%
+    group_by(MRN) %>%
+    arrange(start, .by_group = TRUE) %>%
+    mutate(
+      reexac = row_number() == n() &
+        !is.na(date_second_exac) &
+        exclusion_date == date_second_exac
+    ) %>%
+    ungroup()
+
+  data <- result |>
+    dplyr::select(c(MRN, addr, dep_index, prop_white_tract, incidents, start, end, crime_exposure, reexac)) |>
+    group_by(MRN) |>
+    mutate(
+      origin_date = min(start),
+      end_date = max(end),
+      tstart = as.numeric(start - origin_date),
+      tstop  = as.numeric(end - origin_date)
+    ) |>
+    ungroup() |>
+    filter(tstop > tstart) |>
+    mutate(
+      date_time = as.numeric(end_date - origin_date),
+    ) |>
+    group_by(MRN) |>
+    mutate(t_time = max(tstop) - min(tstart)) |>
+    ungroup()
+
+  data2 <- data %>%
+    group_by(MRN) %>%
+    group_modify(~{
+      df <- .x
+      origin <- unique(df$origin_date)
+      min_date <- min(df$start)
+      max_date <- max(df$end)
+      season_cuts <- seq(floor_date(min_date, "year") - years(1),
+                         ceiling_date(max_date, "year") + years(1),
+                         by = "3 months")
+      season_cuts <- season_cuts[month(season_cuts) %in% c(12,3,6,9)]
+      season_cuts <- as.numeric(season_cuts - origin)
+      season_cuts <- season_cuts[season_cuts > 0 & season_cuts < max(df$tstop)]
+      if(length(season_cuts) == 0) return(df)
+      survSplit(Surv(tstart, tstop, reexac) ~ ., data = df, cut = season_cuts, episode = "season_episode")
+    }) %>%
+    ungroup() %>%
+    mutate(
+      start_date = origin_date + tstart,
+      season = case_when(
+        month(start_date) %in% c(12,1,2)  ~ "Winter",
+        month(start_date) %in% c(3,4,5)   ~ "Spring",
+        month(start_date) %in% c(6,7,8)   ~ "Summer",
+        month(start_date) %in% c(9,10,11) ~ "Fall"
+      )
+    )
+  data2$dep_cat <- cut(
+    data2$dep_index,
+    breaks = quantile(data2$dep_index, probs = seq(0,1,0.25), na.rm = TRUE),
+    include.lowest = TRUE)
+
+  data2$inc_cat <- cut(
+    data2$incidents,
+    breaks = quantile(data2$incidents, probs = seq(0,1,0.25), na.rm = TRUE),
+    include.lowest = TRUE
+    )
+
+  s <- data2 |>
+  group_by(MRN) |>
+  summarise(crime_exposure = any(crime_exposure > 0),
+            reexac = sum(reexac)) |>
+  ungroup()
+
+  model2 <- coxph(
+    Surv(tstart, tstop, reexac) ~
+      crime_exposure +
+      cluster(MRN),
+    data = data2
+  )
+  cat("\n--- Unadjusted model ---\n")
+  cat("HR (crime_exposure):", round(exp(coef(model2)["crime_exposureTRUE"]), 3), "\n")
+  cat("95% CI:", round(exp(confint(model2)["crime_exposureTRUE", 1]), 3), "-",
+      round(exp(confint(model2)["crime_exposureTRUE", 2]), 3), "\n")
+  
+  model <- coxph(
+  Surv(tstart, tstop, reexac) ~
+    crime_exposure +
+    strata(dep_cat, inc_cat) +
+    season +
+    cluster(MRN),
+  data = data2
+)
+  cat("\n--- Adjusted model ---\n")
+  cat("HR (crime_exposure):", round(exp(coef(model)["crime_exposureTRUE"]), 3), "\n")
+  cat("95% CI:", round(exp(confint(model)["crime_exposureTRUE", 1]), 3), "-",
+      round(exp(confint(model)["crime_exposureTRUE", 2]), 3), "\n")
+  print(summary(model))
+
+}
+```
+
+## 100m; 7 days
+```{r}
+run_models(7, 100)
+```
+## 100m; 14 days
+```{r}
+run_models(14, 100)
+```
+## 100m; 21 days
+```{r}
+run_models(21, 100)
+```
+## 100m; 30 days
+```{r}
+run_models(30, 100)
+```
+## 100m; 60 days
+```{r}
+run_models(60, 100)
+```
+
+## 200m; 7 days
+```{r}
+run_models(7, 200)
+```
+## 200m; 14 days
+```{r}
+run_models(14, 200)
+```
+## 200m; 21 days
+```{r}
+run_models(21, 200)
+```
+## 200m; 30 days
+```{r}
+run_models(30, 200)
+```
+## 200m; 60 days
+```{r}
+run_models(60, 200)
+```
+
+## 400m; 7 days
+```{r}
+run_models(7, 400)
+```
+## 400m; 14 days
+```{r}
+run_models(14, 400)
+```
+## 400m; 21 days
+```{r}
+run_models(21, 400)
+```
+## 400m; 30 days
+```{r}
+run_models(30, 400)
+```
+## 400m; 60 days
+```{r}
+run_models(60, 400)
+```
